@@ -368,7 +368,9 @@ processors are the ones whose strategies accept `CreditPhaseStats`;
 
 ### `post_processors/strategies/metric_results.py`
 
-**Status:** already implemented; preserved.
+**Status:** already implemented; **modified** by Requirement 14 to delegate
+spec-name mapping, unit conversion, attribute building, and bucket-boundary
+selection to the new `genai_semconv` module (see next subsection).
 
 **Responsibility:** Map per-record `MetricRecordsData` to OTel histogram
 records. One histogram per metric; one `record()` call per numeric value in
@@ -378,7 +380,144 @@ records. One histogram per metric; one `record()` call per numeric value in
 when `coerce_metric_values` returns an empty list (no numeric values).
 The processor never enqueues a histogram event with an empty payload.
 
-**Requirement map:** 1.5, 1.6, 5.2.
+**Requirement 14 design.** Before emitting a histogram event, the strategy
+calls `genai_semconv.translate(aiperf_metric_name, value_ns, record) ->
+GenAISemconvEmission | None`. If `translate` returns `None`, the metric has
+no spec equivalent and the strategy emits it under `aiperf.*` unchanged.
+If `translate` returns an emission struct, the strategy uses
+`emission.spec_metric_name`, `emission.unit`, `emission.value` (converted),
+`emission.attributes` (spec-required + aiperf-specific merged), and
+`emission.explicit_bucket_boundaries` when creating or reusing the
+histogram. See `genai_semconv.py` below for the emission struct shape and
+mapping tables.
+
+**Requirement map:** 1.5, 1.6, 5.2, 14.1, 14.2, 14.3, 14.4, 14.6, 14.7,
+14.8, 14.9.
+
+### `post_processors/strategies/genai_semconv.py` (NEW)
+
+**Status:** new module introduced by this spec to satisfy Requirement 14.
+No prior implementation in PR 656 head `628162da`.
+
+**Responsibility:** Single source of truth for mapping AIPerf internal
+metric names / units / attributes onto the
+[OTel GenAI semantic convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/).
+Any future revision of the spec should be absorbed by editing this one
+module; no other module should hard-code spec strings.
+
+**Public surface:**
+
+```python
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
+
+@dataclass(frozen=True, slots=True)
+class GenAISemconvEmission:
+    """Payload produced by translate() when a spec equivalent exists."""
+    spec_metric_name: str  # e.g. "gen_ai.client.operation.duration"
+    instrument_kind: str   # "histogram" (all spec metrics are histograms today)
+    unit: str              # "s", "{token}", etc.
+    value: float           # already unit-converted (e.g. ns -> s)
+    attributes: Mapping[str, str | int]  # spec-required + aiperf-specific merged
+    explicit_bucket_boundaries: tuple[float, ...]  # spec-defined buckets
+
+
+# --- Mapping tables (Requirement 14.13) ---
+
+METRIC_NAME_MAP: dict[str, tuple[str, str, tuple[float, ...]]]
+    # key: aiperf metric name (e.g. "request_latency_ns")
+    # value: (spec_metric_name, spec_unit, explicit_bucket_boundaries)
+    # Four entries per Requirement 14.1. Token usage is a special case
+    # because two aiperf metrics (input/output) map to one spec metric
+    # with a discriminating attribute; see TOKEN_USAGE_SPECIAL_CASE below.
+
+UNIT_CONVERTERS: dict[str, Callable[[float], float]]
+    # Per-aiperf-metric converter; e.g. "request_latency_ns" -> ns_to_s.
+    # For metrics already in target units, identity is used.
+
+ATTRIBUTE_BUILDERS: dict[str, Callable[[MetricRecordsData], dict[str, Any]]]
+    # Per-spec-metric builder that extracts spec-required attributes from
+    # a MetricRecordsData record. Typically reads endpoint.type, model name,
+    # server url, error context.
+
+TOKEN_USAGE_SPECIAL_CASE: Mapping[str, str]
+    # {"input_token_count": "input", "output_token_count": "output"}
+    # Merges two aiperf metrics into one spec histogram using
+    # gen_ai.token.type attribute per Requirement 14.1 row 4.
+
+
+# --- Core helpers ---
+
+def translate(
+    aiperf_metric_name: str,
+    aiperf_value: float,
+    record: "MetricRecordsData",
+    *,
+    user_config: "UserConfig",
+) -> GenAISemconvEmission | None:
+    """Return emission payload if aiperf metric has a GenAI spec equivalent;
+    None otherwise. Caller emits verbatim on None (preserving aiperf.* name)."""
+
+
+def infer_provider_name(user_config: "UserConfig") -> str:
+    """Populate gen_ai.provider.name per Requirement 14.5:
+    (a) explicit --gen-ai-provider override wins,
+    (b) else auto-infer from URL host,
+    (c) else '_OTHER'."""
+```
+
+**Well-known `gen_ai.provider.name` host-to-provider mapping**
+(Requirement 14.5 step b):
+
+| URL host pattern | Provider value |
+| --- | --- |
+| `api.openai.com` | `openai` |
+| `api.anthropic.com` | `anthropic` |
+| `api.deepseek.com` | `deepseek` |
+| `api.mistral.ai` | `mistral_ai` |
+| `api.cohere.ai` / `api.cohere.com` | `cohere` |
+| `api.x.ai` | `x_ai` |
+| `api.groq.com` | `groq` |
+| `api.perplexity.ai` | `perplexity` |
+| `generativelanguage.googleapis.com` | `gcp.gemini` |
+| `*-aiplatform.googleapis.com` | `gcp.vertex_ai` |
+| `bedrock-runtime.*.amazonaws.com` | `aws.bedrock` |
+| `*.openai.azure.com` | `azure.ai.openai` |
+| `*.services.ai.azure.com` | `azure.ai.inference` |
+| `*.ibm.com` with Watsonx paths | `ibm.watsonx.ai` |
+| anything else | `_OTHER` |
+
+The mapping table is defined as a tuple of `(re.Pattern, value)` pairs
+iterated in order, so the most specific patterns match first. The caller
+normalises to lowercase.
+
+**`gen_ai.operation.name` mapping** (Requirement 14.4):
+
+| AIPerf `endpoint.type` | `gen_ai.operation.name` |
+| --- | --- |
+| `chat` | `chat` |
+| `completions` | `text_completion` |
+| `embeddings` | `embeddings` |
+| anything else | `chat` (fallback; documented in docstring) |
+
+**`error.type` classifier set** (Requirement 14.7):
+
+| AIPerf condition | `error.type` value |
+| --- | --- |
+| asyncio/HTTP timeout | `timeout` |
+| HTTP 5xx response | `http_5xx` |
+| HTTP 4xx response | `http_4xx` |
+| JSON parse error | `parse_error` |
+| User-initiated cancel | `cancelled` |
+| anything else | `_OTHER` |
+
+**Import-time safety.** This module imports nothing from
+`opentelemetry.*` or `mlflow.*`; it produces pure data (strings, floats,
+tuples) that the calling strategy hands to the SDK. Guard rule from
+Requirement 1.7 applies.
+
+**Requirement map:** 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 14.7, 14.8,
+14.9, 14.13.
 
 ### `post_processors/strategies/timing_results.py`
 
@@ -395,13 +534,26 @@ The MLflow side compensates by accumulating the deltas per
 `(metric, attribute_key)` inside the fanout process. This strategy file
 does not change.
 
-**Requirement map:** 1.5, 5.3, 7.2 (boundary only), 10.6.
+**Design note (Requirement 14.8, 14.9).** Timing metrics keep the
+`aiperf.timing.*` namespace (no spec equivalent). However, before emitting
+each counter/gauge event the strategy calls
+`genai_semconv.cross_metric_attributes(user_config)` to retrieve the
+three Required GenAI attributes (`gen_ai.operation.name`,
+`gen_ai.provider.name`, `gen_ai.request.model`) and merges them into the
+attribute dict so dashboards can join timing metrics with the spec-named
+request metrics on these dimensions.
+
+**Requirement map:** 1.5, 5.3, 7.2 (boundary only), 10.6, 14.8, 14.9.
 
 ### `post_processors/strategies/__init__.py`
 
 Re-exports `MetricResultsStrategy`, `TimingResultsStrategy`, and
-`OTelResultsStrategyProtocol`. **Status:** already implemented; preserved.
-Satisfies Requirement 5.4.
+`OTelResultsStrategyProtocol`. Also re-exports the `genai_semconv`
+module's `translate`, `infer_provider_name`, and
+`cross_metric_attributes` so tests and dashboards can import them via
+`from aiperf.post_processors.strategies import genai_semconv`.
+**Status:** modified by Requirement 14; otherwise preserved.
+Satisfies Requirements 5.4 and 14.13.
 
 ### `post_processors/protocols.py`
 
@@ -513,7 +665,9 @@ without failing the run. Satisfies Requirement 3.4 and Requirement 4.
 **Status:** modified by PR 656; Requirement 1.8 adds `min_length=1` on
 `EndpointConfig.model_names`; Requirement 8.1 fixes the return type of
 `mlflow_resolved_artifact_globs`; Requirement 8.4 removes callers of the
-renamed `otel_streaming_enabled` property.
+renamed `otel_streaming_enabled` property; **Requirement 14.14 adds one
+new CLI field `--gen-ai-provider` and one new property
+`gen_ai_provider_name`**.
 
 **New CLI fields (already in PR 656, preserved):**
 - `--otel-url: str | None`
@@ -525,6 +679,13 @@ renamed `otel_streaming_enabled` property.
 - `--mlflow-tag: list[str]` (key=value, multi-use)
 - `--mlflow-upload: bool` (plot command only)
 
+**New CLI field added by Requirement 14 (carve-out from Req 13.1):**
+- `--gen-ai-provider: str | None` — explicit value for the
+  `gen_ai.provider.name` attribute (Requirement 14.5 path a). When
+  unset, the auto-inference path (Requirement 14.5 path b) runs. When
+  auto-inference also fails, the literal `_OTHER` is emitted
+  (Requirement 14.5 path c).
+
 **New properties (already in PR 656, preserved):**
 - `otel_metrics_url -> str | None`
 - `otel_collector_enabled -> bool`
@@ -534,6 +695,12 @@ renamed `otel_streaming_enabled` property.
 - `mlflow_tags_dict -> dict[str, str]`
 - `mlflow_resolved_artifact_globs -> list[str] | tuple[str, ...]`
   (Requirement 8.1)
+
+**New property added by Requirement 14:**
+- `gen_ai_provider_name -> str` — resolved provider name per
+  Requirement 14.5 precedence (explicit override > host inference >
+  `_OTHER`). Caches the result once computed so the mapping layer and
+  any cross-metric attribute builder see a stable value per run.
 
 **Helper:** `_normalize_otel_metrics_url(raw: str) -> str` — accepts
 `host`, `host:port`, `http://host[:port][/path]`,
@@ -939,6 +1106,49 @@ with `log_artifacts` called exactly once.
 `tests/unit/exporters/test_mlflow_metadata_equality_property.py` plus
 integration test `tests/integration/exporters/test_mlflow_metadata_roundtrip.py`
 
+### Property 9: GenAI semconv translation is faithful, idempotent, and complete
+
+*For any* AIPerf metric name `m` in the set
+`{"request_latency_ns", "time_to_first_token_ns",
+"inter_token_latency_ns", "input_token_count",
+"output_token_count"}`, *for any* valid numeric value `v` and matching
+`MetricRecordsData` record `r`, the result
+`e = genai_semconv.translate(m, v, r, user_config=cfg)` satisfies:
+
+- `e.spec_metric_name` belongs to the fixed set
+  `{"gen_ai.client.operation.duration",
+  "gen_ai.client.operation.time_to_first_chunk",
+  "gen_ai.client.operation.time_per_output_chunk",
+  "gen_ai.client.token.usage"}`.
+- `e.unit` equals the spec-defined unit for `e.spec_metric_name`
+  (`"s"` for duration metrics, `"{token}"` for token usage).
+- `e.value == UNIT_CONVERTERS[m](v)` and, for `_ns` inputs,
+  `e.value == v / 1e9` within 1e-12 absolute tolerance.
+- `e.attributes` contains every Required spec attribute with a
+  non-empty string value: `gen_ai.operation.name` (from
+  `ATTRIBUTE_BUILDERS`), `gen_ai.provider.name` (from
+  `infer_provider_name(cfg)`), and, when `cfg.endpoint.model_names`
+  is non-empty, `gen_ai.request.model`.
+- When the input token metric is `"input_token_count"` or
+  `"output_token_count"`, `e.spec_metric_name == "gen_ai.client.token.usage"`
+  AND `e.attributes["gen_ai.token.type"] ∈ {"input", "output"}` matching
+  the token-usage special case mapping.
+- `e.explicit_bucket_boundaries` is a strictly increasing tuple whose
+  first element > 0 and matches the spec-defined boundaries for
+  `e.spec_metric_name`.
+- *For any* AIPerf metric name outside the fixed mapping set,
+  `translate(...) is None` (the caller emits verbatim).
+- `infer_provider_name(cfg)` satisfies:
+  explicit `--gen-ai-provider` > auto-inference from `endpoint.urls[0]` >
+  `"_OTHER"`; the result is always a non-empty string.
+
+**Validates: Requirements 14.1, 14.2, 14.3, 14.4, 14.5, 14.13**
+**Source of truth:**
+`aiperf.post_processors.strategies.genai_semconv.translate` and
+`aiperf.post_processors.strategies.genai_semconv.infer_provider_name`
+**Test location:**
+`tests/unit/post_processors/test_genai_semconv_property.py`
+
 ## Error Handling
 
 This table enumerates every failure mode introduced by the feature, the
@@ -981,6 +1191,9 @@ the actual profile/plot paths against the in-repo mock server.
 | `test_mlflow_live_run_reuse_property` | property | P6 | 4.2, 11.7 | `tests/unit/exporters/test_mlflow_live_run_reuse_property.py` |
 | `test_fanout_flush_trigger_property` | property | P7 | 7.1 | `tests/unit/post_processors/test_fanout_flush_trigger_property.py` |
 | `test_mlflow_metadata_equality_property` | property | P8 | 4.5, 7.3 | `tests/unit/exporters/test_mlflow_metadata_equality_property.py` |
+| `test_genai_semconv_property` | property | P9 | 14.1, 14.2, 14.3, 14.4, 14.5, 14.13 | `tests/unit/post_processors/test_genai_semconv_property.py` |
+| `test_genai_provider_auto_inference` | example | — | 14.5 | `tests/unit/post_processors/test_genai_semconv_inference.py` |
+| `test_gen_ai_server_namespace_is_never_emitted` | smoke | — | 14.10 | `tests/unit/post_processors/test_genai_semconv_negative.py` |
 | `test_fanout_queue_maxsize_env` | example | — | 7.4 | `tests/unit/post_processors/test_fanout_queue_config.py` |
 | `test_plot_dashboard_and_mlflow_upload_rejected` | example | — | 7.5, 11.10 | `tests/unit/plot/test_plot_cli_runner.py` |
 | `test_mlflow_missing_dep_fails_fast` | example | — | 3.4 | `tests/unit/exporters/test_mlflow_data_exporter_deps.py` |
@@ -1003,7 +1216,7 @@ the actual profile/plot paths against the in-repo mock server.
 - `tests/unit/post_processors/conftest.py` — fake OTel scaffolding that
   substitutes `MeterProvider`, `OTLPMetricExporter`,
   `PeriodicExportingMetricReader`, and records every `record()` /
-  `add()` call in memory. Used by property tests P3–P5, P7.
+  `add()` call in memory. Used by property tests P3–P5, P7, P9.
 - `tests/unit/exporters/conftest.py` — in-memory MLflow client fixture
   (no real MLflow install required); captures
   `log_metric`, `log_params`, `set_tags`, `log_batch`, `log_artifacts`
@@ -1031,7 +1244,8 @@ the actual profile/plot paths against the in-repo mock server.
 | `docs/architecture.md` | New subsection "Telemetry Plane" covering Fanout_Process, Strategy_Protocol dispatch via `--stream`, Deferred_MLflow_Path. Mermaid diagrams reused from this design. | hand-edit | 10.4 |
 | `docs/dev/patterns.md` | New "Strategy Protocol Pattern" subsection with `MetricResultsStrategy` / `TimingResultsStrategy` example; "Drop-Oldest Fanout Queue" pattern. | hand-edit | 10.5 |
 | `docs/metrics-reference.md` | New `aiperf.timing.*` namespace table: counter + gauge definitions, formulas, requirements. | hand-edit | 10.6 |
-| `docs/tutorials/otel-mlflow.md` (new) | End-to-end tutorial: start a collector, start an MLflow tracking server, run `aiperf profile --otel-url ... --mlflow --mlflow-tracking-uri ...`, inspect live dashboard, run `aiperf plot --mlflow-upload` on the same output directory. Sections: Prerequisites, Setup OTel Collector, Setup MLflow, Run AIPerf, Live Dashboards, Plot Upload, Troubleshooting. | hand-edit | 10.7 |
+| `docs/metrics-reference.md` (GenAI section) | New subsection "OpenTelemetry GenAI Semantic Convention Mapping": the four-row mapping table (aiperf name → spec name, unit, buckets), the `gen_ai.operation.name` mapping table, the `gen_ai.provider.name` host-inference table, the `error.type` classifier table, and a note that timing namespace is AIPerf-specific (not in spec). | hand-edit | 14.1, 14.4, 14.5, 14.7, 14.8, 14.13 |
+| `docs/tutorials/otel-mlflow.md` (new) | End-to-end tutorial: start a collector, start an MLflow tracking server, run `aiperf profile --otel-url ... --mlflow --mlflow-tracking-uri ...`, inspect live dashboard, run `aiperf plot --mlflow-upload` on the same output directory. Sections: Prerequisites, Setup OTel Collector, Setup MLflow, Run AIPerf, Live Dashboards, Plot Upload, Troubleshooting (includes the GenAI rename migration note per Requirement 14.12). | hand-edit | 10.7, 14.12 |
 | `README.md` | Tutorial index entry "OTel + MLflow live telemetry" linking to `docs/tutorials/otel-mlflow.md`; mention of `aiperf[mlflow]`, `aiperf[otel]`, `aiperf[mlflow,otel]` extras. | hand-edit | 10.8, 10.10 |
 | `docs/index.yml` | Add `otel-mlflow.md` under the tutorials section so `tools/check_docs_index.py` passes. | hand-edit | 10.8 |
 | `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/python.mdc` | No content change expected; re-check byte identity after editing any one. | `make check-agent-files-sync` | 10.9 |

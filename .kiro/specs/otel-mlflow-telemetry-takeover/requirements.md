@@ -506,6 +506,112 @@ review time is spent on substance, not on housekeeping.
    clean tree.
 8. `pre-commit run --all-files` SHALL succeed.
 
+### Requirement 14: OTel GenAI Semantic Convention Compliance
+
+**User Story:** As an AIPerf operator using Grafana, Datadog, or any OTel
+GenAI-aware observability backend, I want the metric stream from
+`aiperf profile --otel-url ...` to be recognised by the vendor's
+out-of-the-box GenAI dashboards so that I don't have to write custom
+translations just to see AIPerf numbers.
+
+**Rationale:** PR 656 head `628162da` emits metric names under an
+`aiperf.*` private namespace with nanosecond units and without the
+attributes required by the
+[OTel GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/).
+Maintainer feedback from Anthony Casagrande (NVIDIA) flagged that this
+causes AIPerf telemetry to appear as opaque custom metrics in any
+conformant OTel backend. Compliance is a merge-blocker, not a nit.
+The spec is Development status at time of writing; we target its
+current shape and note in documentation that the mapping will track
+future revisions.
+
+**Scope note:** Only the `OTel` streaming path is subject to this
+requirement. MLflow live metrics already use their own `live.*`
+namespace (per Requirements 3 and 7.2) and are not reshaped by this
+requirement.
+
+#### Acceptance Criteria
+
+1. WHERE an AIPerf metric has a direct equivalent in the OTel GenAI
+   client-metrics spec, THE `OTelMetricsResultsProcessor` SHALL emit
+   the metric using the spec-defined name and unit:
+
+   | AIPerf source | GenAI spec metric | Unit | Instrument |
+   | --- | --- | --- | --- |
+   | `request_latency` | `gen_ai.client.operation.duration` | `s` | Histogram |
+   | `time_to_first_token` | `gen_ai.client.operation.time_to_first_chunk` | `s` | Histogram |
+   | `inter_token_latency` | `gen_ai.client.operation.time_per_output_chunk` | `s` | Histogram |
+   | `input_token_count` + `output_token_count` (merged) | `gen_ai.client.token.usage` with `gen_ai.token.type=input\|output` attribute | `{token}` | Histogram |
+
+2. WHERE an AIPerf value is recorded in nanoseconds internally, THE
+   mapping layer SHALL convert to seconds (float) before emitting,
+   because all OTel GenAI duration metrics are spec'd in seconds.
+3. THE histogram instruments for spec-named metrics SHALL be created
+   with the `ExplicitBucketBoundaries` specified by the OTel GenAI
+   spec for that metric, passed via
+   `explicit_bucket_boundaries_advisory` on instrument creation.
+4. Every emitted spec-named metric SHALL carry the Required attributes
+   `gen_ai.operation.name` (mapped from `endpoint.type`, e.g.
+   `chat` / `text_completion` / `embeddings`), `gen_ai.provider.name`
+   (see 14.5), and, when available, `gen_ai.request.model` (from
+   `endpoint.model_names[0]`).
+5. THE AIPerf SHALL populate `gen_ai.provider.name` as follows:
+   - (a) If `--gen-ai-provider <value>` is set, use that value verbatim.
+   - (b) Otherwise, attempt auto-inference from the URL host of
+     `endpoint.urls[0]` against a small, documented mapping table
+     (e.g. `api.openai.com` → `openai`, `api.anthropic.com` → `anthropic`,
+     `bedrock-runtime.*.amazonaws.com` → `aws.bedrock`,
+     `generativelanguage.googleapis.com` → `gcp.gemini`,
+     `*.vertex*.google*` → `gcp.vertex_ai`).
+   - (c) Otherwise, emit the literal string `_OTHER` per the GenAI
+     spec's fallback convention.
+6. Every emitted spec-named metric SHALL also carry Recommended
+   `server.address` and `server.port` attributes parsed from
+   `endpoint.urls[0]`, when parseable.
+7. WHEN a record carries an error, THE mapping layer SHALL populate
+   the `error.type` attribute with a low-cardinality classifier
+   derived from the error category (e.g. `timeout`, `http_5xx`,
+   `parse_error`, `cancelled`); falling back to `_OTHER` when no
+   classifier matches. THE AIPerf SHALL document the classifier set
+   in the mapping module docstring.
+8. AIPerf metrics that have NO equivalent in the GenAI spec (notably
+   every metric derived from `CreditPhaseStats`) SHALL retain the
+   `aiperf.*` namespace and SHALL NOT be renamed by this requirement.
+   Such metrics MAY carry the same GenAI Required attributes
+   (`gen_ai.operation.name`, `gen_ai.provider.name`,
+   `gen_ai.request.model`) to enable cross-metric joins in dashboards.
+9. AIPerf-specific dimensions (e.g. `aiperf.benchmark_phase`,
+   `aiperf.session_num`, `aiperf.turn_index`, `aiperf.worker_id`,
+   `aiperf.record_processor_id`) MAY be attached as additional
+   attributes to spec-named metrics where useful; they SHALL keep
+   the `aiperf.*` attribute prefix to avoid future spec collisions.
+10. THE AIPerf SHALL NOT emit any metric under the `gen_ai.server.*`
+    namespace. AIPerf is a client instrumentation per OTel GenAI
+    semconv §"Generative AI client metrics"; the `gen_ai.server.*`
+    family describes metrics reported by the model server itself
+    and is out of scope for a benchmarking client.
+11. THE AIPerf SHALL NOT emit `gen_ai.input.messages`,
+    `gen_ai.output.messages`, `gen_ai.system_instructions`, or
+    `gen_ai.tool.definitions` events. Content capture is an
+    Opt-In concern per OTel GenAI semconv §Events and is explicitly
+    deferred to a future PR (see Requirement 13.1 carve-out).
+12. THE AIPerf SHALL remove the legacy `aiperf.*` metric names for
+    the four metrics listed in 14.1. A migration note SHALL appear
+    in `docs/tutorials/otel-mlflow.md` §Troubleshooting and in the
+    takeover PR description so users currently reading
+    `aiperf.request_latency_ns` know to switch to
+    `gen_ai.client.operation.duration` (in seconds).
+13. THE new mapping module SHALL live at
+    `src/aiperf/post_processors/strategies/genai_semconv.py` and
+    SHALL expose three tables (`METRIC_NAME_MAP`, `UNIT_CONVERTERS`,
+    `ATTRIBUTE_BUILDERS`) plus a helper `infer_provider_name(...)`.
+    Changes to the spec over time SHALL be absorbed by editing these
+    tables; no other module should hard-code spec names.
+14. THE `--gen-ai-provider` CLI option SHALL be added to
+    `UserConfig`. Because Requirement 13.1 forbids new CLI options
+    beyond PR 656 head, R14.14 formally carves out an exception for
+    this one option. No other new CLI options are in scope.
+
 ### Requirement 13: Out of Scope (Explicit Non-Goals)
 
 **User Story:** As an AIPerf maintainer, I want an explicit list of things
@@ -516,7 +622,8 @@ focused.
 
 1. THE takeover SHALL NOT add any new CLI option, env var, plugin,
    message type, or service beyond what is already in PR 656 head
-   `628162da`.
+   `628162da`, EXCEPT for the single `--gen-ai-provider` option
+   carved out by Requirement 14.14.
 2. THE takeover SHALL NOT remove or rename any public API that
    exists on `main` prior to this change.
 3. THE takeover SHALL NOT switch the project away from
@@ -527,7 +634,15 @@ focused.
    MLflow are in scope.
 5. THE takeover SHALL NOT modify the existing metrics-reference
    metric definitions or formulas; it only adds the
-   `aiperf.timing.*` namespace and documents it.
+   `aiperf.timing.*` namespace and the GenAI semconv mapping
+   (Requirement 14), and documents both.
+6. THE takeover SHALL NOT implement OTel GenAI content capture
+   (`gen_ai.input.messages`, `gen_ai.output.messages`,
+   `gen_ai.system_instructions`, `gen_ai.tool.definitions`). That
+   Opt-In event surface is deferred to a follow-up PR because it
+   requires a separate design for truncation, redaction, and
+   volume controls.
+
 
 ---
 
@@ -576,6 +691,31 @@ file or PR URL so a newcomer can locate the work.
 - [ ] `orjson` in all new JSON I/O (Req 8.5).
 - [ ] `X | Y`, `Field(description=...)`, enum-without-`.value`
       throughout new code (Req 8.6).
+
+### GenAI semconv compliance (NEW)
+
+- [ ] Add `strategies/genai_semconv.py` with three mapping tables
+      (`METRIC_NAME_MAP`, `UNIT_CONVERTERS`, `ATTRIBUTE_BUILDERS`)
+      plus `infer_provider_name()` (Req 14.13).
+- [ ] Rename four metrics to `gen_ai.client.*` names (Req 14.1)
+      and drop the `_ns` suffix after converting ns → s (Req 14.2).
+- [ ] Merge `input_token_count` + `output_token_count` into single
+      `gen_ai.client.token.usage` with `gen_ai.token.type` attribute
+      (Req 14.1 row 4).
+- [ ] Create histograms with `explicit_bucket_boundaries_advisory`
+      per spec (Req 14.3).
+- [ ] Build `gen_ai.operation.name`, `gen_ai.provider.name`,
+      `gen_ai.request.model`, `server.address`, `server.port`,
+      `error.type` attributes on every spec-named metric
+      (Req 14.4, 14.6, 14.7).
+- [ ] Add `--gen-ai-provider` CLI override (Req 14.5, 14.14).
+- [ ] Keep `aiperf.timing.*` metrics; attach GenAI Required
+      attributes to them for cross-metric joins (Req 14.8, 14.9).
+- [ ] Verify NO `gen_ai.server.*` metric is emitted (Req 14.10).
+- [ ] Verify NO GenAI event (`gen_ai.input.messages` etc.) is
+      emitted — content capture is deferred (Req 14.11, 13.6).
+- [ ] Migration note in tutorial + PR description listing the four
+      renamed metrics (Req 14.12).
 
 ### Open inline review items
 

@@ -71,6 +71,22 @@ user says so explicitly; every subsequent task is written against the default.
   reveals that the MLflow backend rewrites line endings or trailing bytes on
   `log_artifacts`, fall back to `orjson.loads` semantic equality and document
   the fallback in a regression-test comment.
+- **GenAI semconv compliance (Requirement 14).** Per maintainer feedback
+  from Anthony Casagrande (NVIDIA) on 2026-05-05, the four request-level
+  metrics (`request_latency_ns`, `time_to_first_token_ns`,
+  `inter_token_latency_ns`, token counts) SHALL be renamed to the
+  [OTel GenAI client-metrics](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/)
+  names with spec-defined units and bucket boundaries; the old
+  `aiperf.*` names for these four are **dropped** (not dual-emitted).
+  `aiperf.timing.*` metrics retain their namespace because the spec has
+  no equivalent, but receive the spec's Required attributes so dashboards
+  can join on them. `--gen-ai-provider` CLI override is added; default
+  uses URL-host auto-inference falling back to `_OTHER`. GenAI events
+  (`gen_ai.input.messages`, `gen_ai.output.messages`,
+  `gen_ai.system_instructions`, `gen_ai.tool.definitions`) are
+  **explicitly out of scope** for this PR per Requirement 13.6 and
+  will be handled in a follow-up PR with its own design for
+  truncation/redaction/volume control.
 
 ---
 
@@ -219,6 +235,159 @@ user says so explicitly; every subsequent task is written against the default.
       `src/aiperf/` and `tests/` should return zero hits.
     - Requirements: 1.8. Design: Components - `common/config/user_config.py`
       (Requirement 1.8 paragraph).
+
+- [ ] 2.5 OTel GenAI Semantic Convention Compliance (Requirement 14)
+
+  Per Anthony Casagrande's review feedback, AIPerf's OTel metric stream
+  must conform to the OTel GenAI semantic convention so that third-party
+  GenAI dashboards (Grafana, Datadog, etc.) recognise AIPerf telemetry
+  out of the box. This epic does four things: introduces a centralised
+  mapping module, renames four request-level metrics to their spec
+  equivalents with correct units and bucket boundaries, adds required
+  spec attributes to every emitted metric, and adds a new
+  `--gen-ai-provider` CLI override. It runs **before** the Round-2
+  defect fixes so those fixes land against the spec-compliant metric
+  names, not the legacy names.
+
+  - [ ] 2.5.1 Add `src/aiperf/post_processors/strategies/genai_semconv.py`
+        with mapping tables and helpers
+    - Create the new module per design §Components -
+      `post_processors/strategies/genai_semconv.py`.
+    - Expose the three mapping tables (`METRIC_NAME_MAP`,
+      `UNIT_CONVERTERS`, `ATTRIBUTE_BUILDERS`), the
+      `TOKEN_USAGE_SPECIAL_CASE` dict, and the
+      `GenAISemconvEmission` frozen-slots dataclass.
+    - Implement `translate(aiperf_metric_name, aiperf_value, record, *,
+      user_config) -> GenAISemconvEmission | None`. Return `None` for
+      any `aiperf_metric_name` not in `METRIC_NAME_MAP` so the caller
+      falls back to the `aiperf.*` emission path.
+    - Implement `infer_provider_name(user_config) -> str` with the
+      precedence chain: explicit `user_config.gen_ai_provider_name`
+      override > regex host match against the documented table >
+      literal `"_OTHER"`.
+    - Implement `cross_metric_attributes(user_config) ->
+      dict[str, str]` returning the three Required spec attributes
+      (`gen_ai.operation.name`, `gen_ai.provider.name`,
+      `gen_ai.request.model`) for timing-strategy callers to merge
+      into their attribute dict.
+    - Do NOT import `opentelemetry.*` or `mlflow.*` in this module;
+      it produces pure data. Guard rule from Requirement 1.7 applies.
+    - Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.13. Design:
+      Components - `post_processors/strategies/genai_semconv.py`.
+
+  - [ ] 2.5.2 Wire the mapping layer through `MetricResultsStrategy.process`
+    - File: `src/aiperf/post_processors/strategies/metric_results.py`.
+    - In `process(...)`, before enqueueing a histogram event, call
+      `emission = genai_semconv.translate(metric_name, value, record,
+      user_config=self._context.user_config)`.
+    - If `emission is None`: preserve current behaviour — enqueue the
+      histogram event with the `aiperf.*` metric name.
+    - If `emission is not None`: enqueue the event with
+      `emission.spec_metric_name`, `emission.unit`, `emission.value`,
+      `emission.attributes`, and pass
+      `emission.explicit_bucket_boundaries` to the histogram creator
+      so `explicit_bucket_boundaries_advisory` is set on first use.
+    - The four input-token-count and output-token-count records must
+      both route to the single `gen_ai.client.token.usage` histogram
+      with `gen_ai.token.type` attribute per
+      `TOKEN_USAGE_SPECIAL_CASE`.
+    - Requirements: 14.1, 14.2, 14.3, 14.4, 14.6, 14.7. Design:
+      Components - `post_processors/strategies/metric_results.py`
+      (Requirement 14 design).
+
+  - [ ] 2.5.3 Wire `cross_metric_attributes` into `TimingResultsStrategy`
+    - File: `src/aiperf/post_processors/strategies/timing_results.py`.
+    - In the attribute-building path of counter and gauge emission,
+      merge `genai_semconv.cross_metric_attributes(user_config)` into
+      the attribute dict before enqueueing. Keep the existing
+      aiperf-specific attributes (`aiperf.benchmark_phase` etc.)
+      alongside the GenAI ones.
+    - Do NOT rename any `aiperf.timing.*` metric — they remain
+      AIPerf-specific (Requirement 14.8).
+    - Requirements: 14.8, 14.9. Design: Components -
+      `post_processors/strategies/timing_results.py` (Requirement 14.8,
+      14.9 design note).
+
+  - [ ] 2.5.4 Add `--gen-ai-provider` CLI option and
+        `gen_ai_provider_name` property to `UserConfig`
+    - File: `src/aiperf/common/config/user_config.py`.
+    - Add field: `gen_ai_provider: str | None = Field(default=None,
+      description="Explicit value for gen_ai.provider.name attribute.
+      When unset, AIPerf auto-infers from the URL host; falls back to
+      '_OTHER' if no match.")`. Registered as CLI flag
+      `--gen-ai-provider`.
+    - Add cached property `gen_ai_provider_name -> str` that returns
+      `genai_semconv.infer_provider_name(self)`. Cache on first call
+      via `functools.cached_property` or equivalent.
+    - This is the ONE carve-out from Requirement 13.1; reference
+      Requirement 14.14 in the field description so future reviewers
+      understand why it exists.
+    - Requirements: 14.5, 14.14. Design: Components -
+      `common/config/user_config.py` (new CLI field + property).
+
+  - [ ] 2.5.5 Confirm NO `gen_ai.server.*` metric or GenAI event is
+        emitted anywhere
+    - Audit `src/aiperf/post_processors/**` and
+      `src/aiperf/exporters/**` for any string containing
+      `gen_ai.server.` or `gen_ai.input.messages` or
+      `gen_ai.output.messages` or `gen_ai.system_instructions` or
+      `gen_ai.tool.definitions`. Expected result: zero hits.
+    - Add a negative-case smoke test
+      `tests/unit/post_processors/test_genai_semconv_negative.py`
+      that imports the mapping module and asserts:
+      (a) no key in `METRIC_NAME_MAP.values()` starts with
+      `"gen_ai.server."`, (b) no string in the module equals any of
+      the four opt-in event names.
+    - Requirements: 14.10, 14.11. Design: Components -
+      `post_processors/strategies/genai_semconv.py`.
+
+  - [ ] 2.5.6 Add property-based test P9 — GenAI semconv translation
+        invariant
+    - Create
+      `tests/unit/post_processors/test_genai_semconv_property.py`.
+    - Property 9 invariant (from design §Correctness Properties):
+      "For any AIPerf metric name m in the set
+      `{request_latency_ns, time_to_first_token_ns,
+      inter_token_latency_ns, input_token_count, output_token_count}`,
+      for any valid numeric value v and matching `MetricRecordsData`
+      record r, the result
+      `e = genai_semconv.translate(m, v, r, user_config=cfg)`
+      satisfies: (a) `e.spec_metric_name` is in the fixed spec set;
+      (b) `e.unit` matches spec ('s' for durations, '{token}' for
+      tokens); (c) `e.value == UNIT_CONVERTERS[m](v)` with ns→s
+      conversion exact to 1e-12 tolerance; (d) `e.attributes`
+      contains `gen_ai.operation.name`, `gen_ai.provider.name`, and
+      when model_names is non-empty, `gen_ai.request.model`;
+      (e) token-count metrics route to `gen_ai.client.token.usage`
+      with `gen_ai.token.type ∈ {input, output}`;
+      (f) `e.explicit_bucket_boundaries` is strictly increasing and
+      matches the spec for that metric; (g) for any aiperf metric
+      NOT in the mapping set, `translate(...) is None`;
+      (h) `infer_provider_name(cfg)` returns explicit override >
+      URL-host inference > '_OTHER', always non-empty."
+    - Source of truth:
+      `aiperf.post_processors.strategies.genai_semconv.translate` and
+      `.infer_provider_name`.
+    - Use Hypothesis with `@settings(max_examples=100)`. Strategies:
+      `st.sampled_from` for metric name, `st.floats(min_value=0,
+      max_value=1e13)` for value, a small builder for
+      `MetricRecordsData` records with varying endpoint/type/url.
+    - Tag comment:
+      `# Feature: otel-mlflow-telemetry-takeover, Property 9: GenAI semconv translation is faithful, idempotent, and complete`.
+    - Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.13, 11.1.
+      Design: Correctness Properties §Property 9.
+
+  - [ ] 2.5.7 Add example test for provider auto-inference
+    - Create
+      `tests/unit/post_processors/test_genai_semconv_inference.py`.
+    - Table-driven test using `@pytest.mark.parametrize` with
+      `pytest.param` entries covering: every well-known host pattern
+      in the design table; explicit override wins over host match;
+      unknown host returns `"_OTHER"`; malformed URL returns
+      `"_OTHER"`; empty URL list returns `"_OTHER"`.
+    - Requirements: 14.5. Design: Components -
+      `post_processors/strategies/genai_semconv.py` (provider host
+      mapping table).
 
 - [ ] 3. Round-2 defect 7.1 — MLflow live flush starvation
 
@@ -700,14 +869,30 @@ user says so explicitly; every subsequent task is written against the default.
     - Requirements: 10.5. Design: Documentation Plan row 5.
 
   - [ ] 10.5 Update `docs/metrics-reference.md` with `aiperf.timing.*`
-        namespace
+        namespace AND the GenAI semconv mapping section
     - Add a new section "Timing Namespace (`aiperf.timing.*`)" listing
       each counter and gauge emitted by `TimingResultsStrategy`, with
       columns: metric name, OTel instrument type (counter or
       up-down-counter), unit, description, source
       `CreditPhaseStats` field, applicable requirement number.
+    - Add a second new section "OpenTelemetry GenAI Semantic
+      Convention Mapping" covering (a) the four-row
+      aiperf→spec rename table (Requirement 14.1), (b) the
+      `gen_ai.operation.name` mapping from `endpoint.type`
+      (Requirement 14.4), (c) the `gen_ai.provider.name` host
+      auto-inference table (Requirement 14.5 step b) with the
+      documented precedence and `_OTHER` fallback, (d) the
+      `error.type` classifier set (Requirement 14.7), (e) a note
+      that `aiperf.timing.*` metrics retain AIPerf-specific names
+      because the GenAI spec has no equivalent but receive the same
+      Required attributes so joins work (Requirement 14.8, 14.9),
+      and (f) an explicit callout that AIPerf does NOT emit any
+      `gen_ai.server.*` metric (Requirement 14.10) or any
+      opt-in GenAI event (Requirement 14.11).
     - Do not modify existing metric definitions — Req 13.5 forbids that.
-    - Requirements: 10.6, 13.5. Design: Documentation Plan row 6.
+    - Requirements: 10.6, 13.5, 14.1, 14.4, 14.5, 14.7, 14.8, 14.9,
+      14.10, 14.11, 14.13. Design: Documentation Plan rows 6 and
+      "GenAI section".
 
   - [ ] 10.6 Write new tutorial `docs/tutorials/otel-mlflow.md`
     - Follow the outline in design §Tutorial Outline
@@ -717,8 +902,16 @@ user says so explicitly; every subsequent task is written against the default.
       Attach plots, Troubleshooting.
     - Use the single-file name per §Assumptions.
     - Use mermaid diagrams only; no ASCII art (repo rule).
-    - Requirements: 10.7. Design: Documentation Plan row 7 and
-      Tutorial Outline.
+    - The Troubleshooting section MUST include a migration note per
+      Requirement 14.12: "If you previously relied on `aiperf.*`
+      metric names (`aiperf.request_latency_ns`, etc.), AIPerf now
+      emits OTel GenAI spec names (`gen_ai.client.operation.duration`,
+      etc.) in seconds. Dashboards querying the old names must be
+      updated; see the mapping table in `docs/metrics-reference.md`."
+    - Also include a "Customising provider.name" subsection showing
+      `--gen-ai-provider vllm` as an example override.
+    - Requirements: 10.7, 14.5, 14.12. Design: Documentation Plan
+      row 7 and Tutorial Outline.
 
   - [ ] 10.7 Update `README.md` — tutorial index and optional extras
     - Add a tutorial index entry "OTel + MLflow live telemetry" linking to
@@ -807,6 +1000,8 @@ user says so explicitly; every subsequent task is written against the default.
         step 7
     - Preferred structure: `feat(telemetry): live OTel metrics + MLflow
       export` followed by per-fix commits
+      `feat(telemetry): conform OTel emission to GenAI semantic convention`
+      (Req 14),
       `fix(telemetry): flush MLflow live metrics on monotonic interval`
       (Req 7.1),
       `fix(telemetry): log cumulative gauge snapshots to MLflow` (Req 7.2),
@@ -844,8 +1039,10 @@ user says so explicitly; every subsequent task is written against the default.
       branch instead and let PR #656 update in place. Do not open a new
       PR in that path.
     - PR description must enumerate the five defect fixes
-      (Reqs 7.1-7.5), reference the two CodeRabbit review rounds, and
-      link design.md and requirements.md for reviewer context.
+      (Reqs 7.1-7.5), the OTel GenAI semconv compliance work (Req 14),
+      reference the two CodeRabbit review rounds plus Anthony
+      Casagrande's GenAI feedback, and link design.md and
+      requirements.md for reviewer context.
     - Requirements: 9.5, 9.6. Design: Rebase Strategy step 9.
 
 ## Notes
